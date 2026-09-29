@@ -911,6 +911,7 @@ class TestPoolingNNDevice(NNTestCase):
         args = (grad_output, input)
         if kernel_size is not None:
             args += (kernel_size, output_size)
+        grad_output.requires_grad_()
         expected = backward(*args, indices)
 
         if memory_format is None:
@@ -920,18 +921,14 @@ class TestPoolingNNDevice(NNTestCase):
         self.assertFalse(noncontiguous.is_contiguous())
         self.assertEqual(noncontiguous, indices)
 
-        grad_output.requires_grad_()
         grad_input = backward(*args, noncontiguous)
         self.assertEqual(grad_input, expected)
         grad_grad_input = torch.arange(
             1, input.numel() + 1, dtype=input.dtype, device=device
         ).reshape(input_shape)
+        expected = torch.autograd.grad(expected, grad_output, grad_grad_input)[0]
         actual = torch.autograd.grad(grad_input, grad_output, grad_grad_input)[0]
-
-        expected = grad_grad_input.flatten(-spatial_dims).gather(
-            -1, noncontiguous.flatten(-spatial_dims)
-        )
-        self.assertEqual(actual, expected.reshape(output_shape))
+        self.assertEqual(actual, expected)
 
     @expectedFailureMPS  # Op not implemented
     def test_FractionalMaxPool2d_zero_batch(self, device):
