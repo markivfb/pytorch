@@ -12,6 +12,7 @@
 #include <torch/csrc/distributed/c10d/hooks/FlightRecorderHook.hpp>
 #include <torch/csrc/distributed/c10d/hooks/NanCheckHook.hpp>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 #ifndef _WIN32
@@ -105,6 +106,41 @@ bool registerGilChecker() {
 }
 
 static bool registered = registerGilChecker();
+
+::c10d::nccl2::MaterializedCollectiveConfig materializeCollectiveConfig(
+    const c10::IValue& config) {
+  TORCH_CHECK_TYPE(
+      config.isPyObject(), "Collective config must be a Python object");
+  pybind11::gil_scoped_acquire gil;
+  auto config_obj = py::reinterpret_borrow<py::object>(config.toPyObject());
+  auto nccl_core = py::module_::import("nccl.core.communicator");
+  TORCH_CHECK_TYPE(
+      py::isinstance(config_obj, nccl_core.attr("NCCLCollConfig")),
+      "config must be an nccl.core.NCCLCollConfig");
+  // The tuple owns the native config and its vendor extension chain.
+  auto materialized =
+      nccl_core.attr("_materialize_coll_config")(config_obj).cast<py::tuple>();
+  auto lowpp = materialized[0];
+  auto config_type =
+      py::module_::import("nccl.bindings.nccl").attr("CollConfig");
+  TORCH_CHECK_TYPE(
+      py::isinstance(lowpp, config_type),
+      "config must materialize an nccl.bindings.nccl.CollConfig");
+  auto data = lowpp.attr("ptr").cast<uintptr_t>();
+  TORCH_CHECK(data != 0, "config.ptr must be nonzero");
+  return {
+      reinterpret_cast<const void*>(data), // NOLINT(performance-no-int-to-ptr)
+      torch::jit::toIValue(std::move(materialized), c10::PyObjectType::get())};
+}
+
+bool registerCollectiveConfigConverter() {
+  ::c10d::nccl2::get_collective_config_converter() =
+      &materializeCollectiveConfig;
+  return true;
+}
+
+static bool collective_config_converter_registered =
+    registerCollectiveConfigConverter();
 #endif // USE_C10D_NCCL
 
 // Wrapper to ensure GIL is released before destructing ProcessGroupGloo
@@ -163,6 +199,23 @@ PYBIND11_DECLARE_HOLDER_TYPE(T, IntrusivePtrNoGilDestructor<T>, true)
 namespace torch::distributed::c10d {
 
 namespace {
+
+template <typename Options>
+py::object getCollectiveConfig(const Options& options) {
+  if (!options.config.has_value()) {
+    return py::none();
+  }
+  return torch::jit::toPyObject(options.config.value());
+}
+
+template <typename Options>
+void setCollectiveConfig(Options& options, const py::object& config) {
+  if (config.is_none()) {
+    options.config = std::nullopt;
+    return;
+  }
+  options.config = torch::jit::toIValue(config, c10::PyObjectType::get());
+}
 
 py::bytes toPyBytes(const std::vector<uint8_t>& data) {
   return py::bytes(reinterpret_cast<const char*>(data.data()), data.size());
@@ -1193,20 +1246,32 @@ Example:
       .def_readwrite("rootRank", &::c10d::BroadcastOptions::rootRank)
       .def_readwrite("rootTensor", &::c10d::BroadcastOptions::rootTensor)
       .def_readwrite("timeout", &::c10d::BroadcastOptions::timeout)
-      .def_readwrite("asyncOp", &::c10d::BroadcastOptions::asyncOp);
+      .def_readwrite("asyncOp", &::c10d::BroadcastOptions::asyncOp)
+      .def_property(
+          "config",
+          &getCollectiveConfig<::c10d::BroadcastOptions>,
+          &setCollectiveConfig<::c10d::BroadcastOptions>);
 
   py::class_<::c10d::AllreduceOptions>(module, "AllreduceOptions")
       .def(py::init<>())
       .def_readwrite("reduceOp", &::c10d::AllreduceOptions::reduceOp)
       .def_readwrite("timeout", &::c10d::AllreduceOptions::timeout)
-      .def_readwrite("asyncOp", &::c10d::AllreduceOptions::asyncOp);
+      .def_readwrite("asyncOp", &::c10d::AllreduceOptions::asyncOp)
+      .def_property(
+          "config",
+          &getCollectiveConfig<::c10d::AllreduceOptions>,
+          &setCollectiveConfig<::c10d::AllreduceOptions>);
 
   py::class_<::c10d::AllreduceCoalescedOptions>(
       module, "AllreduceCoalescedOptions")
       .def(py::init<>())
       .def_readwrite("reduceOp", &::c10d::AllreduceCoalescedOptions::reduceOp)
       .def_readwrite("timeout", &::c10d::AllreduceCoalescedOptions::timeout)
-      .def_readwrite("asyncOp", &::c10d::AllreduceCoalescedOptions::asyncOp);
+      .def_readwrite("asyncOp", &::c10d::AllreduceCoalescedOptions::asyncOp)
+      .def_property(
+          "config",
+          &getCollectiveConfig<::c10d::AllreduceCoalescedOptions>,
+          &setCollectiveConfig<::c10d::AllreduceCoalescedOptions>);
 
   py::class_<::c10d::ReduceOptions>(module, "ReduceOptions")
       .def(py::init<>())
@@ -1214,18 +1279,30 @@ Example:
       .def_readwrite("rootRank", &::c10d::ReduceOptions::rootRank)
       .def_readwrite("rootTensor", &::c10d::ReduceOptions::rootTensor)
       .def_readwrite("timeout", &::c10d::ReduceOptions::timeout)
-      .def_readwrite("asyncOp", &::c10d::ReduceOptions::asyncOp);
+      .def_readwrite("asyncOp", &::c10d::ReduceOptions::asyncOp)
+      .def_property(
+          "config",
+          &getCollectiveConfig<::c10d::ReduceOptions>,
+          &setCollectiveConfig<::c10d::ReduceOptions>);
 
   py::class_<::c10d::AllgatherOptions>(module, "AllgatherOptions")
       .def(py::init<>())
       .def_readwrite("timeout", &::c10d::AllgatherOptions::timeout)
-      .def_readwrite("asyncOp", &::c10d::AllgatherOptions::asyncOp);
+      .def_readwrite("asyncOp", &::c10d::AllgatherOptions::asyncOp)
+      .def_property(
+          "config",
+          &getCollectiveConfig<::c10d::AllgatherOptions>,
+          &setCollectiveConfig<::c10d::AllgatherOptions>);
 
   py::class_<::c10d::GatherOptions>(module, "GatherOptions")
       .def(py::init<>())
       .def_readwrite("rootRank", &::c10d::GatherOptions::rootRank)
       .def_readwrite("timeout", &::c10d::GatherOptions::timeout)
-      .def_readwrite("asyncOp", &::c10d::GatherOptions::asyncOp);
+      .def_readwrite("asyncOp", &::c10d::GatherOptions::asyncOp)
+      .def_property(
+          "config",
+          &getCollectiveConfig<::c10d::GatherOptions>,
+          &setCollectiveConfig<::c10d::GatherOptions>);
 
   py::class_<::c10d::ScatterOptions>(module, "ScatterOptions")
       .def(py::init<>())
@@ -1237,7 +1314,11 @@ Example:
       .def(py::init<>())
       .def_readwrite("reduceOp", &::c10d::ReduceScatterOptions::reduceOp)
       .def_readwrite("timeout", &::c10d::ReduceScatterOptions::timeout)
-      .def_readwrite("asyncOp", &::c10d::ReduceScatterOptions::asyncOp);
+      .def_readwrite("asyncOp", &::c10d::ReduceScatterOptions::asyncOp)
+      .def_property(
+          "config",
+          &getCollectiveConfig<::c10d::ReduceScatterOptions>,
+          &setCollectiveConfig<::c10d::ReduceScatterOptions>);
 
   py::class_<::c10d::BarrierOptions>(module, "BarrierOptions")
       .def(py::init<>())
@@ -1249,7 +1330,11 @@ Example:
   py::class_<::c10d::AllToAllOptions>(module, "AllToAllOptions")
       .def(py::init<>())
       .def_readwrite("timeout", &::c10d::AllToAllOptions::timeout)
-      .def_readwrite("asyncOp", &::c10d::AllToAllOptions::asyncOp);
+      .def_readwrite("asyncOp", &::c10d::AllToAllOptions::asyncOp)
+      .def_property(
+          "config",
+          &getCollectiveConfig<::c10d::AllToAllOptions>,
+          &setCollectiveConfig<::c10d::AllToAllOptions>);
 
   py::class_<::c10d::ReconfigureOptions>(module, "ReconfigureOptions")
       .def(py::init<>())
@@ -3259,7 +3344,7 @@ Unsupported backends ignore this call. This API is experimental and subject to c
               "(test whether the backend supports completion hooks)")
           .def(
               "broadcast",
-              &::c10d::Backend::broadcast,
+              &::c10d::Backend::broadcastConfig,
               py::arg("tensors"),
               py::arg("opts") = ::c10d::BroadcastOptions(),
               py::call_guard<py::gil_scoped_release>())
@@ -3281,7 +3366,7 @@ Unsupported backends ignore this call. This API is experimental and subject to c
               py::call_guard<py::gil_scoped_release>())
           .def(
               "allreduce",
-              &::c10d::Backend::allreduce,
+              &::c10d::Backend::allreduceConfig,
               py::arg("tensors"),
               py::arg("opts") = ::c10d::AllreduceOptions(),
               py::call_guard<py::gil_scoped_release>())
@@ -3318,13 +3403,13 @@ Unsupported backends ignore this call. This API is experimental and subject to c
               py::call_guard<py::gil_scoped_release>())
           .def(
               "allreduce_coalesced",
-              &::c10d::Backend::allreduce_coalesced,
+              &::c10d::Backend::allreduce_coalescedConfig,
               py::arg("tensors"),
               py::arg("opts") = ::c10d::AllreduceCoalescedOptions(),
               py::call_guard<py::gil_scoped_release>())
           .def(
               "reduce",
-              &::c10d::Backend::reduce,
+              &::c10d::Backend::reduceConfig,
               py::arg("tensors"),
               py::arg("opts") = ::c10d::ReduceOptions(),
               py::call_guard<py::gil_scoped_release>())
@@ -3349,14 +3434,14 @@ Unsupported backends ignore this call. This API is experimental and subject to c
               py::call_guard<py::gil_scoped_release>())
           .def(
               "allgather",
-              &::c10d::Backend::allgather,
+              &::c10d::Backend::allgatherConfig,
               py::arg("output_tensors"),
               py::arg("input_tensors"),
               py::arg("opts") = ::c10d::AllgatherOptions(),
               py::call_guard<py::gil_scoped_release>())
           .def(
               "all_gather_single",
-              &::c10d::Backend::all_gather_single,
+              &::c10d::Backend::all_gather_singleConfig,
               py::arg("output"),
               py::arg("input"),
               py::arg("opts") = ::c10d::AllgatherOptions(),
@@ -3366,7 +3451,7 @@ Unsupported backends ignore this call. This API is experimental and subject to c
           // deprecated C++ method.
           .def(
               "_allgather_base",
-              &::c10d::Backend::all_gather_single,
+              &::c10d::Backend::all_gather_singleConfig,
               py::arg("output"),
               py::arg("input"),
               py::arg("opts") = ::c10d::AllgatherOptions(),
@@ -3389,14 +3474,14 @@ Unsupported backends ignore this call. This API is experimental and subject to c
               py::call_guard<py::gil_scoped_release>())
           .def(
               "allgather_coalesced",
-              &::c10d::Backend::allgather_coalesced,
+              &::c10d::Backend::allgather_coalescedConfig,
               py::arg("output_lists"),
               py::arg("input_list"),
               py::arg("opts") = ::c10d::AllgatherOptions(),
               py::call_guard<py::gil_scoped_release>())
           .def(
               "gather",
-              &::c10d::Backend::gather,
+              &::c10d::Backend::gatherConfig,
               py::arg("output_tensors"),
               py::arg("input_tensors"),
               py::arg("opts") = ::c10d::GatherOptions(),
@@ -3425,7 +3510,7 @@ Unsupported backends ignore this call. This API is experimental and subject to c
               py::call_guard<py::gil_scoped_release>())
           .def(
               "gather_single",
-              &::c10d::Backend::gather_single,
+              &::c10d::Backend::gather_singleConfig,
               py::arg("output"),
               py::arg("input"),
               py::arg("opts") = ::c10d::GatherOptions(),
@@ -3435,7 +3520,7 @@ Unsupported backends ignore this call. This API is experimental and subject to c
           // deprecated C++ method.
           .def(
               "gather_into_tensor",
-              &::c10d::Backend::gather_single,
+              &::c10d::Backend::gather_singleConfig,
               py::arg("output"),
               py::arg("input"),
               py::arg("opts") = ::c10d::GatherOptions(),
@@ -3471,7 +3556,7 @@ Unsupported backends ignore this call. This API is experimental and subject to c
               py::call_guard<py::gil_scoped_release>())
           .def(
               "reduce_scatter",
-              &::c10d::Backend::reduce_scatter,
+              &::c10d::Backend::reduce_scatterConfig,
               py::arg("output_tensors"),
               py::arg("input_tensors"),
               py::arg("opts") = ::c10d::ReduceScatterOptions(),
@@ -3497,7 +3582,7 @@ Unsupported backends ignore this call. This API is experimental and subject to c
               py::call_guard<py::gil_scoped_release>())
           .def(
               "reduce_scatter_single",
-              &::c10d::Backend::reduce_scatter_single,
+              &::c10d::Backend::reduce_scatter_singleConfig,
               py::arg("outputTensor"),
               py::arg("inputTensor"),
               py::arg("opts") = ::c10d::ReduceScatterOptions(),
@@ -3507,14 +3592,14 @@ Unsupported backends ignore this call. This API is experimental and subject to c
           // the deprecated C++ method.
           .def(
               "_reduce_scatter_base",
-              &::c10d::Backend::reduce_scatter_single,
+              &::c10d::Backend::reduce_scatter_singleConfig,
               py::arg("outputTensor"),
               py::arg("inputTensor"),
               py::arg("opts") = ::c10d::ReduceScatterOptions(),
               py::call_guard<py::gil_scoped_release>())
           .def(
               "all_to_all_single",
-              &::c10d::Backend::all_to_all_single,
+              &::c10d::Backend::all_to_all_singleConfig,
               py::arg("output_tensor"),
               py::arg("input_tensor"),
               py::arg("output_split_sizes"),
@@ -3526,7 +3611,7 @@ Unsupported backends ignore this call. This API is experimental and subject to c
           // deprecated C++ method.
           .def(
               "alltoall_base",
-              &::c10d::Backend::all_to_all_single,
+              &::c10d::Backend::all_to_all_singleConfig,
               py::arg("output_tensor"),
               py::arg("input_tensor"),
               py::arg("output_split_sizes"),
@@ -3554,7 +3639,7 @@ Unsupported backends ignore this call. This API is experimental and subject to c
               py::call_guard<py::gil_scoped_release>())
           .def(
               "alltoall",
-              &::c10d::Backend::alltoall,
+              &::c10d::Backend::alltoallConfig,
               py::arg("output_tensor"),
               py::arg("input_tensor"),
               py::arg("opts") = ::c10d::AllToAllOptions(),
@@ -3654,20 +3739,20 @@ Unsupported backends ignore this call. This API is experimental and subject to c
             )")
           .def(
               "allreduce_sparse",
-              &::c10d::Backend::allreduce_sparse,
+              &::c10d::Backend::allreduce_sparseConfig,
               py::arg("tensors"),
               py::arg("opts") = ::c10d::AllreduceOptions(),
               py::call_guard<py::gil_scoped_release>())
           .def(
               "all_gather_single_coalesced",
-              &::c10d::Backend::all_gather_single_coalesced,
+              &::c10d::Backend::all_gather_single_coalescedConfig,
               py::arg("outputs"),
               py::arg("inputs"),
               py::arg("opts") = ::c10d::AllgatherOptions(),
               py::call_guard<py::gil_scoped_release>())
           .def(
               "reduce_scatter_single_coalesced",
-              &::c10d::Backend::reduce_scatter_single_coalesced,
+              &::c10d::Backend::reduce_scatter_single_coalescedConfig,
               py::arg("outputs"),
               py::arg("inputs"),
               py::arg("opts") = ::c10d::ReduceScatterOptions(),

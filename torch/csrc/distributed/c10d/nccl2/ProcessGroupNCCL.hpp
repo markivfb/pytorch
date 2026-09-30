@@ -142,6 +142,97 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
   }
   c10::intrusive_ptr<::c10d::Backend::Options> getBackendOptions() override;
 
+  c10::intrusive_ptr<::c10d::Work> broadcastConfig(
+      std::vector<at::Tensor>& tensors,
+      const BroadcastOptions& opts = BroadcastOptions()) override {
+    return broadcast(tensors, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> allreduceConfig(
+      std::vector<at::Tensor>& tensors,
+      const AllreduceOptions& opts = AllreduceOptions()) override {
+    return allreduce(tensors, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> allreduce_coalescedConfig(
+      std::vector<at::Tensor>& tensors,
+      const AllreduceCoalescedOptions& opts =
+          AllreduceCoalescedOptions()) override {
+    return allreduce_coalesced(tensors, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> reduceConfig(
+      std::vector<at::Tensor>& tensors,
+      const ReduceOptions& opts = ReduceOptions()) override {
+    return reduce(tensors, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> allgatherConfig(
+      std::vector<std::vector<at::Tensor>>& outputTensors,
+      std::vector<at::Tensor>& inputTensors,
+      const AllgatherOptions& opts = AllgatherOptions()) override {
+    return allgather(outputTensors, inputTensors, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> all_gather_singleConfig(
+      at::Tensor& outputBuffer,
+      at::Tensor& inputBuffer,
+      const AllgatherOptions& opts = AllgatherOptions()) override {
+    return all_gather_single(outputBuffer, inputBuffer, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> allgather_coalescedConfig(
+      std::vector<std::vector<at::Tensor>>& outputTensorLists,
+      std::vector<at::Tensor>& inputTensors,
+      const AllgatherOptions& opts = AllgatherOptions()) override {
+    return allgather_coalesced(outputTensorLists, inputTensors, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> all_gather_single_coalescedConfig(
+      std::vector<at::Tensor>& outputs,
+      std::vector<at::Tensor>& inputs,
+      const AllgatherOptions& opts = AllgatherOptions()) override {
+    return all_gather_single_coalesced(outputs, inputs, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> gather_singleConfig(
+      at::Tensor& outputBuffer,
+      at::Tensor& inputBuffer,
+      const GatherOptions& opts = GatherOptions()) override {
+    return gather_single(outputBuffer, inputBuffer, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> reduce_scatterConfig(
+      std::vector<at::Tensor>& outputTensors,
+      std::vector<std::vector<at::Tensor>>& inputTensors,
+      const ReduceScatterOptions& opts = ReduceScatterOptions()) override {
+    return reduce_scatter(outputTensors, inputTensors, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> reduce_scatter_singleConfig(
+      at::Tensor& outputBuffer,
+      at::Tensor& inputBuffer,
+      const ReduceScatterOptions& opts = ReduceScatterOptions()) override {
+    return reduce_scatter_single(outputBuffer, inputBuffer, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> reduce_scatter_single_coalescedConfig(
+      std::vector<at::Tensor>& outputs,
+      std::vector<at::Tensor>& inputs,
+      const ReduceScatterOptions& opts = ReduceScatterOptions()) override {
+    return reduce_scatter_single_coalesced(outputs, inputs, opts);
+  }
+
+  c10::intrusive_ptr<::c10d::Work> all_to_all_singleConfig(
+      at::Tensor& outputBuffer,
+      at::Tensor& inputBuffer,
+      std::vector<int64_t>& outputSplitSizes,
+      std::vector<int64_t>& inputSplitSizes,
+      const AllToAllOptions& opts = AllToAllOptions()) override {
+    return all_to_all_single(
+        outputBuffer, inputBuffer, outputSplitSizes, inputSplitSizes, opts);
+  }
+
   c10::intrusive_ptr<::c10d::Work> broadcast(
       std::vector<at::Tensor>& tensors,
       const ::c10d::BroadcastOptions& opts =
@@ -394,7 +485,8 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
   void waitForNcclOperation(
       ncclResult_t status,
       std::chrono::milliseconds timeout,
-      std::string_view operation);
+      std::string_view operation,
+      const MaterializedCollectiveConfig& config = {});
   // Tears the NCCL communicator down. This NEVER terminates the process --
   // a user-initiated abort()/shutdown() must be survivable, matching
   // ::c10d::ProcessGroupNCCL::abort(). Callers that are handling a
@@ -438,6 +530,9 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
       const at::Tensor& inputTensor);
 
  private:
+  MaterializedCollectiveConfig prepareCollectiveConfig(
+      const OptionalCollectiveConfig& config);
+
   // RAII helper that cleans up NCCL premul-sum reduction ops. Built from a
   // c10d::ReduceOp (the premul factor is read from its supplement).
   struct RedOpRAII {
@@ -518,45 +613,53 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
       at::Tensor& tensor,
       int root,
       bool async_op,
-      std::chrono::milliseconds timeout);
+      std::chrono::milliseconds timeout,
+      const MaterializedCollectiveConfig& config = {});
   c10::intrusive_ptr<WorkNCCL> all_reduce(
       at::Tensor& tensor,
       const ::c10d::ReduceOp& op,
       bool async_op,
-      std::chrono::milliseconds timeout);
+      std::chrono::milliseconds timeout,
+      const MaterializedCollectiveConfig& config = {});
   c10::intrusive_ptr<WorkNCCL> reduceImpl(
       const at::Tensor& tensor,
       int root,
       const ::c10d::ReduceOp& op,
       bool async_op,
-      std::chrono::milliseconds timeout);
+      std::chrono::milliseconds timeout,
+      const MaterializedCollectiveConfig& config = {});
   c10::intrusive_ptr<WorkNCCL> all_gather(
       const std::vector<at::Tensor>& tensor_list,
       const at::Tensor& tensor,
       bool async_op,
-      std::chrono::milliseconds timeout);
+      std::chrono::milliseconds timeout,
+      const MaterializedCollectiveConfig& config = {});
   c10::intrusive_ptr<WorkNCCL> allGatherSingleImpl(
       at::Tensor& output,
       const at::Tensor& input,
       bool async_op,
-      std::chrono::milliseconds timeout);
+      std::chrono::milliseconds timeout,
+      const MaterializedCollectiveConfig& config = {});
   c10::intrusive_ptr<WorkNCCL> reduce_scatter(
       at::Tensor& output,
       const std::vector<at::Tensor>& input_list,
       const ::c10d::ReduceOp& op,
       bool async_op,
-      std::chrono::milliseconds timeout);
+      std::chrono::milliseconds timeout,
+      const MaterializedCollectiveConfig& config = {});
   c10::intrusive_ptr<WorkNCCL> reduceScatterSingleImpl(
       at::Tensor& output,
       const at::Tensor& input,
       const ::c10d::ReduceOp& op,
       bool async_op,
-      std::chrono::milliseconds timeout);
+      std::chrono::milliseconds timeout,
+      const MaterializedCollectiveConfig& config = {});
   c10::intrusive_ptr<WorkNCCL> allToAllSingleImpl(
       at::Tensor& output,
       const at::Tensor& input,
       bool async_op,
-      std::chrono::milliseconds timeout);
+      std::chrono::milliseconds timeout,
+      const MaterializedCollectiveConfig& config = {});
   c10::intrusive_ptr<WorkNCCL> all_to_all_v_single(
       at::Tensor& output,
       const at::Tensor& input,
@@ -583,7 +686,8 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
       const at::Tensor& input_tensor,
       int root,
       bool async_op,
-      std::chrono::milliseconds timeout);
+      std::chrono::milliseconds timeout,
+      const MaterializedCollectiveConfig& config = {});
 
   // Resolve a c10d per-op timeout (kUnsetTimeout -> communicator default).
   std::chrono::milliseconds operationTimeout(
@@ -721,6 +825,9 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
   // startCoalescing() and endCoalescing(); send()/recv() append into it.
   std::optional<BatchSendRecv> coalescing_batch_;
   c10::intrusive_ptr<WorkNCCL> coalesced_work_;
+
+  // NCCL groups span communicators on the calling thread.
+  static thread_local size_t time_estimate_depth_;
 
   std::unordered_map<
       unsigned long long,
