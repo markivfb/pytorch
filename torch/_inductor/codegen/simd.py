@@ -534,22 +534,36 @@ def tile_fits_reduction_epilogue(
     for node in epilogue_nodes:
         produced |= node.get_buffer_names()
     reductions = [node for node in epilogue_nodes if node.is_reduction()]
-    axes = OrderedSet(
-        template_reduction_axis(node, template, produced) for node in reductions
-    )
-    if axes == OrderedSet([1]):
+    axes = [template_reduction_axis(node, template, produced) for node in reductions]
+    columns = [node for node, axis in zip(reductions, axes) if axis == 1]
+    if columns:
         # Column results are only complete after the wrapper reduces the
         # partials, so no epilogue node may read them.
-        results = OrderedSet().union(*(node.get_buffer_names() for node in reductions))
-        return all(
-            node.is_reduction()
-            or (node.group[1] == (m * n, 1) and not node.used_buffer_names() & results)
-            for node in epilogue_nodes
+        results = OrderedSet().union(*(node.get_buffer_names() for node in columns))
+        epilogue_nodes = [node for node in epilogue_nodes if node not in columns]
+        if any(node.used_buffer_names() & results for node in epilogue_nodes):
+            return False
+        # Column reductions run after the row ones and read only the template
+        # output and the nodes before the first row reduction.
+        first_row = next(
+            (i for i, node in enumerate(epilogue_nodes) if node.is_reduction()),
+            len(epilogue_nodes),
         )
+        available = OrderedSet([template.get_name()]).union(
+            *(node.get_buffer_names() for node in epilogue_nodes[:first_row])
+        )
+        if any(
+            dep.name in produced and dep.name not in available
+            for node in columns
+            for dep in node.read_writes.reads
+        ) or any(node.group[1] != (m * n, 1) for node in epilogue_nodes[:first_row]):
+            return False
+        if first_row == len(epilogue_nodes):
+            return True
     # A row reduction must see whole rows in one store. Reducing across column
     # tiles isn't supported yet.
-    return not axes - OrderedSet([0]) and V.graph.sizevars.statically_known_geq(
-        tile[1], n
+    return not OrderedSet(axes) - OrderedSet([0, 1]) and (
+        V.graph.sizevars.statically_known_geq(tile[1], n)
     )
 
 
@@ -2975,19 +2989,19 @@ class SIMDScheduling(BaseScheduling):
         ):
             why("template reduction epilogue not satisfied")
             return False
-        if (
-            config.triton.template_reduction_epilogue
-            and node1.is_template()
-            and any(
-                node.is_reduction()
-                and node.group[1] != tuple(node1.get_template_node().get_size())
-                for node in (*node1.get_nodes(), *node2.get_nodes())
-            )
-            and self.can_fuse_template_reduction_epilogue(node1, node2)
-        ):
+        if config.triton.template_reduction_epilogue and node1.is_template():
+            template = node1.get_template_node()
+            nodes = (*node1.get_nodes(), *node2.get_nodes())
+            produced = OrderedSet().union(*(node.get_buffer_names() for node in nodes))
             # A column reduction of the template output, which the tiling
-            # checks below can't express.
-            return True
+            # checks below can't express. Its group can't identify it: a split
+            # column reduction's can equal the output's (M, N).
+            if any(
+                node.is_reduction()
+                and template_reduction_axis(node, template, produced) == 1
+                for node in nodes
+            ) and self.can_fuse_template_reduction_epilogue(node1, node2):
+                return True
 
         if isinstance(node1, scheduler.FusedNestedReductions):
             # The scheduler already validated this vertical append. The normal
